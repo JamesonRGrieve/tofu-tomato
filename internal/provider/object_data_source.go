@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/JamesonRGrieve/tofu-tomato/internal/tomato"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -13,43 +14,54 @@ import (
 )
 
 var (
-	_ datasource.DataSource              = (*objectDataSource)(nil)
-	_ datasource.DataSourceWithConfigure = (*objectDataSource)(nil)
+	_ datasource.DataSource              = (*nvramDataSource)(nil)
+	_ datasource.DataSourceWithConfigure = (*nvramDataSource)(nil)
 )
 
-// NewObjectDataSource constructs the generic aruba_aos_object data source.
-func NewObjectDataSource() datasource.DataSource { return &objectDataSource{} }
+// NewObjectDataSource constructs the tomato_nvram data source.
+func NewObjectDataSource() datasource.DataSource { return &nvramDataSource{} }
 
-type objectDataSource struct {
+type nvramDataSource struct {
 	client *tomato.Client
 }
 
-type objectDataModel struct {
-	Path     types.String `tfsdk:"path"`
-	Response types.String `tfsdk:"response"`
+type nvramDataModel struct {
+	Key     types.String `tfsdk:"key"`
+	Value   types.String `tfsdk:"value"`
+	Present types.Bool   `tfsdk:"present"`
+	All     types.String `tfsdk:"all"`
 }
 
-func (d *objectDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+func (d *nvramDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_nvram"
 }
 
-func (d *objectDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+func (d *nvramDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Read any ArubaOS-Switch REST resource by its `/rest/v8` path.",
+		MarkdownDescription: "Read Tomato NVRAM. Set `key` to read a single variable (`value` + `present`); " +
+			"omit `key` to read the full `nvram show` output into `all`.",
 		Attributes: map[string]schema.Attribute{
-			"path": schema.StringAttribute{
-				Required:            true,
-				MarkdownDescription: "Resource path under `/rest/v8` (leading slash optional), e.g. `vlans`, `system`, `vlans/40`.",
+			"key": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "NVRAM variable name to read (e.g. `lan_ipaddr`). Omit to read the whole config into `all`.",
 			},
-			"response": schema.StringAttribute{
+			"value": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "The raw JSON response body from the switch.",
+				MarkdownDescription: "The variable's current value (empty string when unset or when reading the whole config).",
+			},
+			"present": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether the variable is defined on the device (false when `key` is omitted).",
+			},
+			"all": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Full `nvram show` output (every `key=value` line) when `key` is omitted; empty otherwise.",
 			},
 		},
 	}
 }
 
-func (d *objectDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+func (d *nvramDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
@@ -61,22 +73,32 @@ func (d *objectDataSource) Configure(_ context.Context, req datasource.Configure
 	d.client = client
 }
 
-func (d *objectDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
-	var m objectDataModel
+func (d *nvramDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+	var m nvramDataModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := d.client.Get(normPath(m.Path.ValueString()))
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+	key := strings.TrimSpace(m.Key.ValueString())
+	if m.Key.IsNull() || key == "" {
+		raw, err := d.client.Show()
+		if err != nil {
+			resp.Diagnostics.AddError("Tomato nvram show failed", err.Error())
+			return
+		}
+		m.All = types.StringValue(string(raw))
+		m.Value = types.StringValue("")
+		m.Present = types.BoolValue(false)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 		return
 	}
-	compact, err := compactJSON(raw)
+	v, present, err := d.client.GetNVRAM(key)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("Tomato nvram get failed", err.Error())
 		return
 	}
-	m.Response = types.StringValue(compact)
+	m.Value = types.StringValue(v)
+	m.Present = types.BoolValue(present)
+	m.All = types.StringValue("")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }

@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/JamesonRGrieve/tofu-tomato/internal/tomato"
@@ -19,78 +19,80 @@ import (
 )
 
 var (
-	_ resource.Resource                = (*objectResource)(nil)
-	_ resource.ResourceWithConfigure   = (*objectResource)(nil)
-	_ resource.ResourceWithImportState = (*objectResource)(nil)
+	_ resource.Resource                = (*nvramResource)(nil)
+	_ resource.ResourceWithConfigure   = (*nvramResource)(nil)
+	_ resource.ResourceWithImportState = (*nvramResource)(nil)
 )
 
-// NewObjectResource constructs the generic aruba_aos_object resource.
-func NewObjectResource() resource.Resource { return &objectResource{} }
+// NewObjectResource constructs the generic tomato_nvram resource.
+func NewObjectResource() resource.Resource { return &nvramResource{} }
 
-type objectResource struct {
+type nvramResource struct {
 	client *tomato.Client
 }
 
-// objectModel is the state/plan shape for aruba_aos_object.
-type objectModel struct {
-	ID           types.String `tfsdk:"id"`
-	Path         types.String `tfsdk:"path"`
-	CreatePath   types.String `tfsdk:"create_path"`
-	DeleteMethod types.String `tfsdk:"delete_method"`
-	DeleteBody   types.String `tfsdk:"delete_body"`
-	Body         types.String `tfsdk:"body"`
+// nvramModel is the state/plan shape for tomato_nvram.
+//
+//   - Keys     — the managed key=value map, declared as a JSON object. These are
+//     the ONLY NVRAM variables this resource touches.
+//   - Restart  — service(s) to restart after commit ("wan", "dnsmasq", "*", …);
+//     empty means no restart.
+//   - Previous — computed snapshot of each managed key's value (or absence)
+//     captured at create/import, used to restore on destroy.
+//   - ID       — pipe-joined sorted key names, stable per managed set.
+type nvramModel struct {
+	ID       types.String `tfsdk:"id"`
+	Keys     types.String `tfsdk:"keys"`
+	Restart  types.String `tfsdk:"restart"`
+	Previous types.String `tfsdk:"previous"`
 }
 
-func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+func (r *nvramResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_nvram"
 }
 
-func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *nvramResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A generic ArubaOS-Switch REST resource addressed by its `/rest/v8` path. " +
-			"Covers 100% of the AOS-S API: any singleton (`system`, `stp`, `dns`, `lldp`) or " +
-			"collection item (`vlans/40`, `vlans-ports/40-3`, `ports/5`, `snmp-server/communities/public`). " +
-			"`body` declares only the keys this resource manages; device-returned keys outside `body` are " +
-			"ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
+		MarkdownDescription: "A generic Tomato (FreshTomato / AdvancedTomato) NVRAM resource. " +
+			"`keys` is a JSON object of the NVRAM variables this resource manages — any variable " +
+			"is expressible. On create/update the declared keys are `nvram set`, then `nvram commit`, " +
+			"then the `restart` service is restarted. **Manage-declared-only:** only the keys in " +
+			"`keys` are ever touched; every other NVRAM variable is left alone. A subset/no-op plan " +
+			"modifier suppresses the diff when every declared key already holds its declared value on " +
+			"the device, so an existing config imports to 0-diff and unmanaged NVRAM is never clobbered. " +
+			"On destroy, each managed key is restored to the value it had at create/import (or unset if " +
+			"it did not exist), then committed and restarted.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Resource id — equal to `path`.",
+				MarkdownDescription: "Resource id — the managed key names, sorted and pipe-joined.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"path": schema.StringAttribute{
+			"keys": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "Addressed resource path under `/rest/v8` (leading slash optional), " +
-					"used for GET/PUT/DELETE. E.g. `vlans/40`, `system`, `vlans-ports/40-3`.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				MarkdownDescription: "JSON object mapping NVRAM variable name → value, e.g. " +
+					"`jsonencode({ lan_ipaddr = \"192.168.1.1\", wan_proto = \"dhcp\" })`. " +
+					"Only these variables are managed; all values are strings (NVRAM is stringly-typed).",
+				PlanModifiers: []planmodifier.String{nvramSubsetSuppress{}},
 			},
-			"create_path": schema.StringAttribute{
+			"restart": schema.StringAttribute{
 				Optional: true,
-				MarkdownDescription: "Collection path to POST to on create (e.g. `vlans` while `path` is `vlans/40`). " +
-					"When unset, create is an idempotent PUT to `path`. Carry it in the import id " +
-					"(`<path>|<create_path>`) so an imported resource matches config and lands at 0-diff.",
+				MarkdownDescription: "Service(s) to `service <svc> restart` after committing — e.g. " +
+					"`wan`, `lan`, `dnsmasq`, `firewall`, `httpd`, or `*` for all. Omit / empty for keys " +
+					"that need no restart (read live or reboot-only).",
 			},
-			"delete_method": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "How to destroy: `DELETE` (default), `PUT` (send `delete_body` to `path` — " +
-					"reset a singleton to default), or `NONE` (no-op for un-deletable singletons). Carry it in the " +
-					"import id (`<path>|<create_path>|<delete_method>`) to match config.",
-			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON body PUT to `path` on destroy when `delete_method = \"PUT\"`. Import id field 4.",
-			},
-			"body": schema.StringAttribute{
-				Required: true,
-				MarkdownDescription: "JSON object of the declared (managed) attributes. State holds the full " +
-					"device object; drift is detected only on these keys.",
-				PlanModifiers: []planmodifier.String{subsetSuppress{}},
+			"previous": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "Computed snapshot of each managed key's prior value, captured at " +
+					"create/import. JSON object: a string value means the key existed with that value; " +
+					"`null` means it did not exist. Used to restore exactly on destroy.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 		},
 	}
 }
 
-func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+func (r *nvramResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
@@ -103,232 +105,377 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
-// normPath ensures a leading slash.
-func normPath(p string) string {
-	p = strings.TrimSpace(p)
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return p
-}
-
-// parentCollection returns the collection path for an item path by dropping the
-// last segment: "/vlans-ports/58-41" -> "/vlans-ports", "/vlans/58" -> "/vlans".
-// Returns "" for a top-level singleton (no parent).
-func parentCollection(p string) string {
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
-		return ""
-	}
-	return p[:i]
-}
-
-func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var m objectModel
+func (r *nvramResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var m nvramModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	body := []byte(m.Body.ValueString())
-	if !json.Valid(body) {
-		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
+	declared, err := parseKeyMap(m.Keys.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid keys", err.Error())
 		return
 	}
-	var err error
-	if !m.CreatePath.IsNull() && m.CreatePath.ValueString() != "" {
-		// Explicit collection POST (e.g. /vlans).
-		_, err = r.client.Post(normPath(m.CreatePath.ValueString()), body)
+	// Snapshot prior values so destroy can restore exactly.
+	prev, err := r.snapshot(declared)
+	if err != nil {
+		resp.Diagnostics.AddError("Tomato read (snapshot) failed", err.Error())
+		return
+	}
+	if err := r.applyKeys(declared, m.Restart); err != nil {
+		resp.Diagnostics.AddError("Tomato set/commit failed", err.Error())
+		return
+	}
+	m.ID = types.StringValue(keyID(declared))
+	m.Previous = types.StringValue(prev)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+func (r *nvramResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var m nvramModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	declared, err := parseKeyMap(m.Keys.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid keys in state", err.Error())
+		return
+	}
+	// Refresh each managed key's current device value into `keys`. The subset
+	// plan modifier reconciles this against the config at plan time, so a value
+	// that still matches config shows 0-diff and a drifted value shows an update.
+	current := make(map[string]string, len(declared))
+	for k := range declared {
+		v, present, gerr := r.client.GetNVRAM(k)
+		if gerr != nil {
+			resp.Diagnostics.AddError("Tomato read failed", gerr.Error())
+			return
+		}
+		if !present {
+			// Key vanished on the device — drop it from the refreshed map so the
+			// diff surfaces (config will want to re-set it).
+			continue
+		}
+		current[k] = v
+	}
+	m.Keys = types.StringValue(marshalKeyMap(current))
+	m.ID = types.StringValue(keyID(declared))
+	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+func (r *nvramResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state nvramModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	declared, err := parseKeyMap(plan.Keys.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid keys", err.Error())
+		return
+	}
+	prevState, _ := parseSnapshot(state.Previous.ValueString())
+	oldDeclared, _ := parseKeyMap(state.Keys.ValueString())
+
+	// Any key managed before but no longer declared is restored to its captured
+	// prior value (or unset) — it leaves management cleanly.
+	for k := range oldDeclared {
+		if _, still := declared[k]; still {
+			continue
+		}
+		if err := r.restoreKey(k, prevState); err != nil {
+			resp.Diagnostics.AddError("Tomato restore (dropped key) failed", err.Error())
+			return
+		}
+	}
+	// Newly-declared keys get a snapshot entry captured now; keep existing ones.
+	merged := prevState
+	for k := range declared {
+		if _, ok := merged[k]; ok {
+			continue
+		}
+		v, present, gerr := r.client.GetNVRAM(k)
+		if gerr != nil {
+			resp.Diagnostics.AddError("Tomato read (snapshot) failed", gerr.Error())
+			return
+		}
+		merged[k] = snapEntry(v, present)
+	}
+	// Prune snapshot entries for keys no longer managed.
+	for k := range merged {
+		if _, ok := declared[k]; !ok {
+			delete(merged, k)
+		}
+	}
+	if err := r.applyKeys(declared, plan.Restart); err != nil {
+		resp.Diagnostics.AddError("Tomato set/commit failed", err.Error())
+		return
+	}
+	plan.ID = types.StringValue(keyID(declared))
+	plan.Previous = types.StringValue(marshalSnapshot(merged))
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+func (r *nvramResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var m nvramModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	declared, err := parseKeyMap(m.Keys.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid keys in state", err.Error())
+		return
+	}
+	prev, _ := parseSnapshot(m.Previous.ValueString())
+	for k := range declared {
+		if err := r.restoreKey(k, prev); err != nil {
+			resp.Diagnostics.AddError("Tomato restore failed", err.Error())
+			return
+		}
+	}
+	if err := r.client.Commit(); err != nil {
+		resp.Diagnostics.AddError("Tomato commit failed", err.Error())
+		return
+	}
+	if err := r.client.RestartService(m.Restart.ValueString()); err != nil {
+		resp.Diagnostics.AddError("Tomato service restart failed", err.Error())
+	}
+}
+
+func (r *nvramResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// Import id is a pipe-delimited list of NVRAM key names, optionally with a
+	// trailing "@restart" suffix on the LAST field naming the restart service so
+	// the imported state matches config:
+	//   lan_ipaddr|lan_netmask|wan_proto@wan
+	// The following Read populates `keys` with the live values and `previous` is
+	// captured here from the live device.
+	raw := strings.TrimSpace(req.ID)
+	restart := ""
+	if i := strings.LastIndex(raw, "@"); i >= 0 {
+		restart = raw[i+1:]
+		raw = raw[:i]
+	}
+	names := splitKeys(raw)
+	if len(names) == 0 {
+		resp.Diagnostics.AddError("Invalid import id",
+			"expected pipe-delimited NVRAM key names, optionally suffixed with @<restart-service>")
+		return
+	}
+	if r.client == nil {
+		resp.Diagnostics.AddError("Provider not configured", "import requires a configured provider client")
+		return
+	}
+	keys := make(map[string]string, len(names))
+	snap := make(map[string]*string, len(names))
+	for _, k := range names {
+		v, present, err := r.client.GetNVRAM(k)
+		if err != nil {
+			resp.Diagnostics.AddError("Tomato import read failed", err.Error())
+			return
+		}
+		if present {
+			keys[k] = v
+		}
+		snap[k] = snapEntry(v, present)
+	}
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), keyID(declaredSet(names)))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("keys"), marshalKeyMap(keys))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("previous"), marshalSnapshot(snap))...)
+	if restart != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("restart"), restart)...)
 	} else {
-		// Idempotent PUT to the item path; if the item doesn't exist yet
-		// (AOS-S replies 404 to PUT on a not-yet-present collection item, e.g.
-		// a new vlans-ports membership), fall back to POSTing the parent
-		// collection. This makes the generic resource handle both upsert-PUT
-		// singletons and POST-create collections without an explicit create_path.
-		p := normPath(m.Path.ValueString())
-		_, err = r.client.Put(p, body)
-		if err != nil && tomato.NotFound(err) {
-			if parent := parentCollection(p); parent != "" {
-				_, err = r.client.Post(parent, body)
-			}
-		}
-	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S create failed", err.Error())
-		return
-	}
-	m.ID = m.Path
-	// Store the declared body verbatim so the create plan/state are consistent;
-	// the next refresh (Read) replaces it with the full device object.
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
-}
-
-func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var m objectModel
-	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	raw, err := r.client.Get(normPath(m.Path.ValueString()))
-	if err != nil {
-		if tomato.NotFound(err) {
-			resp.State.RemoveResource(ctx)
-			return
-		}
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
-		return
-	}
-	// Store the full device object (compacted). The subset plan modifier
-	// reconciles it against the declared config body at plan time.
-	compact, err := compactJSON(raw)
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
-		return
-	}
-	m.Body = types.StringValue(compact)
-	m.ID = m.Path
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
-}
-
-func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var m objectModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	body := []byte(m.Body.ValueString())
-	if !json.Valid(body) {
-		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
-		return
-	}
-	if _, err := r.client.Put(normPath(m.Path.ValueString()), body); err != nil {
-		resp.Diagnostics.AddError("AOS-S update failed", err.Error())
-		return
-	}
-	m.ID = m.Path
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
-}
-
-func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
-	var m objectModel
-	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	method := "DELETE"
-	if !m.DeleteMethod.IsNull() && m.DeleteMethod.ValueString() != "" {
-		method = strings.ToUpper(m.DeleteMethod.ValueString())
-	}
-	var err error
-	switch method {
-	case "NONE":
-		// Singleton that cannot be deleted (e.g. /system); just drop from state.
-	case "PUT":
-		if m.DeleteBody.IsNull() {
-			resp.Diagnostics.AddError("delete_method=PUT requires delete_body", "no reset body provided")
-			return
-		}
-		_, err = r.client.Put(normPath(m.Path.ValueString()), []byte(m.DeleteBody.ValueString()))
-	default: // DELETE
-		_, err = r.client.Delete(normPath(m.Path.ValueString()))
-		if err != nil && tomato.NotFound(err) {
-			err = nil // already gone
-		}
-	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S delete failed", err.Error())
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("restart"), types.StringNull())...)
 	}
 }
 
-func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import id is a pipe-delimited tuple so the imported state matches the
-	// config's operational hints exactly (→ 0-diff, no spurious update/replace):
-	//   <path>[|<create_path>[|<delete_method>[|<delete_body>]]]
-	// Empty fields are treated as null. Body is populated on the following Read.
-	parts := strings.Split(req.ID, "|")
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[0])...)
-	setOpt := func(p string, i int) {
-		if i < len(parts) && parts[i] != "" {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), parts[i])...)
-		} else {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), types.StringNull())...)
+// applyKeys sets every declared key, commits, then restarts the named service.
+func (r *nvramResource) applyKeys(declared map[string]string, restart types.String) error {
+	// Deterministic order keeps behavior reproducible and tests stable.
+	for _, k := range sortedKeys(declared) {
+		if err := r.client.SetNVRAM(k, declared[k]); err != nil {
+			return err
 		}
 	}
-	setOpt("create_path", 1)
-	setOpt("delete_method", 2)
-	setOpt("delete_body", 3)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
+	if err := r.client.Commit(); err != nil {
+		return err
+	}
+	return r.client.RestartService(restart.ValueString())
+}
+
+// snapshot captures the current value/absence of every declared key as a JSON
+// snapshot object for restore-on-destroy.
+func (r *nvramResource) snapshot(declared map[string]string) (string, error) {
+	snap := make(map[string]*string, len(declared))
+	for k := range declared {
+		v, present, err := r.client.GetNVRAM(k)
+		if err != nil {
+			return "", err
+		}
+		snap[k] = snapEntry(v, present)
+	}
+	return marshalSnapshot(snap), nil
+}
+
+// restoreKey restores a single key to its snapshot state: set to the captured
+// value, or unset if it did not previously exist (or has no snapshot entry).
+func (r *nvramResource) restoreKey(k string, snap map[string]*string) error {
+	if v, ok := snap[k]; ok && v != nil {
+		return r.client.SetNVRAM(k, *v)
+	}
+	return r.client.UnsetNVRAM(k)
 }
 
 // ---------------------------------------------------------------------------
-// subset plan modifier — suppress diff when every declared key already matches
-// the full device object held in prior state. This is what lets a subset
-// `body` import/refresh to 0-diff without clobbering unmanaged device fields.
+// Pure helpers — JSON key map + snapshot encoding, id derivation. Unit-tested.
 // ---------------------------------------------------------------------------
 
-type subsetSuppress struct{}
-
-func (subsetSuppress) Description(context.Context) string {
-	return "Suppress diff when all declared JSON keys already match the device object in state."
+// parseKeyMap parses the `keys` JSON object into a string→string map. All values
+// must be JSON strings (NVRAM is stringly-typed); a non-string value is an error.
+func parseKeyMap(s string) (map[string]string, error) {
+	if strings.TrimSpace(s) == "" {
+		return map[string]string{}, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, fmt.Errorf("`keys` must be a JSON object: %w", err)
+	}
+	out := make(map[string]string, len(raw))
+	for k, rv := range raw {
+		var v string
+		if err := json.Unmarshal(rv, &v); err != nil {
+			return nil, fmt.Errorf("key %q: NVRAM values must be strings, got %s", k, string(rv))
+		}
+		out[k] = v
+	}
+	return out, nil
 }
-func (subsetSuppress) MarkdownDescription(context.Context) string {
-	return (subsetSuppress{}).Description(nil)
+
+// marshalKeyMap serializes a key map as a compact, key-sorted JSON object.
+func marshalKeyMap(m map[string]string) string {
+	out, err := json.Marshal(m) // map marshalling sorts keys
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
 }
 
-func (subsetSuppress) PlanModifyString(_ context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+// parseSnapshot parses a snapshot object: each value is a JSON string (key
+// existed with that value) or null (key did not exist).
+func parseSnapshot(s string) (map[string]*string, error) {
+	out := map[string]*string{}
+	if strings.TrimSpace(s) == "" {
+		return out, nil
+	}
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// marshalSnapshot serializes a snapshot map as compact, key-sorted JSON.
+func marshalSnapshot(m map[string]*string) string {
+	out, err := json.Marshal(m)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// snapEntry builds a snapshot entry from a (value, present) read result.
+func snapEntry(v string, present bool) *string {
+	if !present {
+		return nil
+	}
+	val := v
+	return &val
+}
+
+// keyID derives the resource id from the managed key set: sorted, pipe-joined.
+func keyID(m map[string]string) string {
+	return strings.Join(sortedKeys(m), "|")
+}
+
+// declaredSet turns a name slice into a set-shaped map (values irrelevant).
+func declaredSet(names []string) map[string]string {
+	m := make(map[string]string, len(names))
+	for _, n := range names {
+		m[n] = ""
+	}
+	return m
+}
+
+// sortedKeys returns the keys of m in ascending order.
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// splitKeys splits a pipe-delimited key list, trimming and dropping empties.
+func splitKeys(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, "|") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// subset / no-op plan modifier — suppress the diff on `keys` when every declared
+// key already holds its declared value on the device (the refreshed state held
+// in prior state). This is what lets a declared NVRAM subset import/refresh to
+// 0-diff without ever touching unmanaged variables.
+// ---------------------------------------------------------------------------
+
+type nvramSubsetSuppress struct{}
+
+func (nvramSubsetSuppress) Description(context.Context) string {
+	return "Suppress diff when every declared NVRAM key already holds its declared value on the device."
+}
+func (nvramSubsetSuppress) MarkdownDescription(context.Context) string {
+	return (nvramSubsetSuppress{}).Description(nil)
+}
+
+func (nvramSubsetSuppress) PlanModifyString(_ context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
 	if req.StateValue.IsNull() || req.StateValue.IsUnknown() {
 		return // create — nothing to reconcile against
 	}
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	// All declared (config) keys already match the device object in prior state:
-	// keep the full prior object and show no diff. Otherwise leave the planned
-	// (config) value in place so the drift surfaces as an update.
-	if subsetMatches(req.StateValue.ValueString(), req.ConfigValue.ValueString()) {
+	// Prior state holds the device's current managed-key values (refreshed by
+	// Read). If every declared (config) key already matches, keep prior state and
+	// show no diff; otherwise leave the config value so the drift is an update.
+	if nvramSubsetMatches(req.StateValue.ValueString(), req.ConfigValue.ValueString()) {
 		resp.PlanValue = req.StateValue
 	}
 }
 
-// subsetMatches reports whether every top-level key in the config JSON object
-// is present in the prior JSON object with a structurally-equal value (config
-// is a value-subset of prior). Invalid JSON on either side returns false so the
-// caller falls back to a normal diff.
-func subsetMatches(prior, cfg string) bool {
-	var p, c map[string]json.RawMessage
-	if json.Unmarshal([]byte(prior), &p) != nil {
+// nvramSubsetMatches reports whether every key in the config object is present
+// in the prior object with an equal value (config is a value-subset of prior).
+// Invalid JSON on either side returns false so the caller falls back to a diff.
+func nvramSubsetMatches(prior, cfg string) bool {
+	p, err := parseKeyMap(prior)
+	if err != nil {
 		return false
 	}
-	if json.Unmarshal([]byte(cfg), &c) != nil {
+	c, err := parseKeyMap(cfg)
+	if err != nil {
 		return false
 	}
 	for k, cv := range c {
 		pv, ok := p[k]
-		if !ok || !jsonEqual(cv, pv) {
+		if !ok || pv != cv {
 			return false
 		}
 	}
 	return true
-}
-
-// jsonEqual compares two raw JSON values structurally (order-insensitive).
-func jsonEqual(a, b json.RawMessage) bool {
-	var av, bv any
-	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
-		return false
-	}
-	return reflect.DeepEqual(av, bv)
-}
-
-// compactJSON re-serializes raw JSON in compact, key-sorted-by-encoder form.
-func compactJSON(raw []byte) (string, error) {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return "", err
-	}
-	out, err := json.Marshal(v)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
 }

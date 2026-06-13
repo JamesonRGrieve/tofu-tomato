@@ -1,240 +1,272 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Package aos is a minimal client for the ArubaOS-Switch (AOS-S) REST API
-// (v8, HTTPS, cookie-based session auth) served by ProVision-era switches
-// such as the 2530 / 2920 / 2930F running WB/YA/YC firmware (16.x).
+// Package tomato is a minimal NVRAM client for Tomato-firmware routers
+// (FreshTomato / AdvancedTomato, the Broadcom/MIPS-and-ARM lineage descended
+// from the original Tomato by Jonathan Zarate) driven over SSH (Dropbear).
 //
-// AOS-S is NOT ArubaOS-CX: the official aruba/terraform-provider-aoscx targets
-// CX only and does not manage these switches. AOS-S has no Terraform provider
-// upstream, hence this one. The API surface is documented in HPE's "REST API
-// for AOS-S" guides; this client is generic over it (any /rest/v8 path).
+// Why SSH and not HTTP. Tomato has no clean REST API: all configuration lives
+// in NVRAM, and the web UI (httpd) writes by POSTing nvram `var=value` form
+// fields to /update.cgi with a CSRF token (_http_id) scraped from a page plus a
+// _service field naming the service(s) to restart. That write path is usable,
+// but the READ path over HTTP is the dealbreaker — there is no CGI that returns
+// a single nvram value; the status pages embed values inside inline JavaScript
+// that you would have to scrape and parse per-firmware. The manage-declared-only
+// subset model (read each declared key's current value, diff it, 0-diff on
+// import) needs an exact, structured read of any variable. Over SSH that is just
+// `nvram get <key>` — exact, generic, firmware-independent. So SSH is the
+// strictly cleaner transport for a generic resource; see CLAUDE.md §"Transport".
+//
+// We invoke the system `ssh` binary via os/exec rather than an in-process SSH
+// library. This keeps the module dependency set unchanged (no golang.org/x/
+// crypto/ssh) and reuses the lab's existing SSH machinery — Dropbear key auth or
+// OpenBao-signed SSH certificates are configured in the user's ssh_config /
+// agent exactly as for every other lab host, so this client never handles a
+// private key itself.
 package tomato
 
 import (
 	"bytes"
-	"crypto/tls"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
-	"net/http"
+	"os/exec"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// Client is a session-authenticated AOS-S REST client. It logs in lazily on
-// the first call and reuses the session cookie; callers may share one Client
-// across resources (the provider does). Safe for concurrent use.
-type Client struct {
-	base     string // e.g. https://192.168.2.210/rest/v8
-	user     string
-	password string
-	http     *http.Client
+// sentinel is emitted by a probe command so we can distinguish an unset NVRAM
+// variable (empty output) from a present-but-empty one. `nvram get` prints the
+// value with no trailing newline and exits 0 whether or not the key exists, so a
+// bare `nvram get k` cannot tell "" (unset) from "" (set to empty). We instead
+// ask the shell to report existence explicitly.
+const sentinel = "__TOMATO_NVRAM_UNSET__"
 
-	mu     sync.Mutex
-	cookie string // "sessionId=..." once logged in
+// Client runs NVRAM operations on a Tomato router over SSH. It is safe for
+// concurrent use; each call spawns its own ssh process. Callers may share one
+// Client across resources (the provider does).
+type Client struct {
+	host    string // host or host:port style is split into addr/port
+	addr    string
+	port    string
+	user    string
+	keyFile string // optional explicit identity file (-i)
+	sshBin  string
+	timeout time.Duration
+	// extraArgs are appended to every ssh invocation (e.g. ProxyJump). Mostly
+	// for tests; normal use relies on the user's ssh_config.
+	extraArgs []string
 }
 
 // Config configures a Client.
 type Config struct {
-	// Host is the switch address (host or host:port), no scheme.
+	// Host is the router address (host or host:port), no scheme. The default
+	// SSH port is 22; Tomato's Dropbear commonly listens on 22 (configurable).
 	Host string
-	// Username / Password are the AOS-S operator/manager credentials.
+	// Username is the SSH user — "root" on Tomato/Dropbear.
 	Username string
-	Password string
-	// Insecure skips TLS verification (AOS-S ships a self-signed cert; true is
-	// the norm on a lab/OOB management network).
-	Insecure bool
-	// Timeout per request (default 30s).
+	// KeyFile is an optional identity file (ssh -i). When empty, the system
+	// ssh client resolves the key/agent/cert from ssh_config as usual.
+	KeyFile string
+	// SSHBinary overrides the ssh executable (default "ssh"). For tests.
+	SSHBinary string
+	// Timeout per SSH invocation (default 30s).
 	Timeout time.Duration
+	// ExtraArgs are appended to every ssh command line (e.g. -J jumphost,
+	// -o options). Normal deployments leave this empty and use ssh_config.
+	ExtraArgs []string
 }
 
-// NewClient builds a Client. It does not contact the switch until the first
-// API call.
+// NewClient builds a Client. It does not contact the router until the first
+// operation.
 func NewClient(c Config) *Client {
 	if c.Timeout == 0 {
 		c.Timeout = 30 * time.Second
 	}
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure}, //nolint:gosec // self-signed mgmt cert
-		// AOS-S serves one session at a time; keep connections lean.
-		MaxIdleConns:    2,
-		IdleConnTimeout: 30 * time.Second,
+	bin := c.SSHBinary
+	if bin == "" {
+		bin = "ssh"
 	}
-	host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "https://"), "/")
-	host = strings.TrimPrefix(host, "http://")
+	user := c.Username
+	if user == "" {
+		user = "root"
+	}
+	addr, port := splitHostPort(c.Host)
 	return &Client{
-		base:     fmt.Sprintf("https://%s/rest/v8", host),
-		user:     c.Username,
-		password: c.Password,
-		http:     &http.Client{Timeout: c.Timeout, Transport: tr},
+		host:      c.Host,
+		addr:      addr,
+		port:      port,
+		user:      user,
+		keyFile:   c.KeyFile,
+		sshBin:    bin,
+		timeout:   c.Timeout,
+		extraArgs: c.ExtraArgs,
 	}
 }
 
-// APIError is returned when the switch responds with a non-2xx status.
-type APIError struct {
-	Method string
-	Path   string
-	Status int
-	Body   string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("aos %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
-}
-
-// NotFound reports whether err is an APIError with a 404 status.
-func NotFound(err error) bool {
-	var ae *APIError
-	if e, ok := err.(*APIError); ok {
-		ae = e
+// splitHostPort splits "host" or "host:port" into (host, port). Port is "" when
+// not given (ssh then uses its default / ssh_config).
+func splitHostPort(h string) (string, string) {
+	h = strings.TrimSpace(h)
+	h = strings.TrimPrefix(h, "ssh://")
+	if i := strings.LastIndex(h, ":"); i > 0 && !strings.Contains(h[i+1:], "]") {
+		// Reject IPv6 without brackets by only treating a trailing :digits as a port.
+		if _, err := strconv.Atoi(h[i+1:]); err == nil {
+			return h[:i], h[i+1:]
+		}
 	}
-	return ae != nil && ae.Status == http.StatusNotFound
+	return h, ""
 }
 
-// login establishes a session cookie. Caller must hold c.mu.
-func (c *Client) login() error {
-	body, _ := json.Marshal(map[string]string{"userName": c.user, "password": c.password})
-	req, err := http.NewRequest(http.MethodPost, c.base+"/login-sessions", bytes.NewReader(body))
+// SSHError is returned when an ssh invocation exits non-zero.
+type SSHError struct {
+	Cmd      string
+	ExitCode int
+	Stderr   string
+}
+
+func (e *SSHError) Error() string {
+	return fmt.Sprintf("tomato ssh %q: exit %d: %s", e.Cmd, e.ExitCode, strings.TrimSpace(e.Stderr))
+}
+
+// run executes a single remote shell command over SSH and returns its stdout.
+// The remote command is passed as one argument to ssh, which hands it to the
+// router's shell — so callers must shell-quote any interpolated values.
+func (c *Client) run(remote string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	args := []string{
+		"-o", "BatchMode=yes", // never prompt; fail instead of hanging
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds(c.timeout)),
+	}
+	if c.port != "" {
+		args = append(args, "-p", c.port)
+	}
+	if c.keyFile != "" {
+		args = append(args, "-i", c.keyFile, "-o", "IdentitiesOnly=yes")
+	}
+	args = append(args, c.extraArgs...)
+	target := c.addr
+	if c.user != "" {
+		target = c.user + "@" + c.addr
+	}
+	args = append(args, target, remote)
+
+	cmd := exec.CommandContext(ctx, c.sshBin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	if err != nil {
-		return err
+		code := -1
+		var ee *exec.ExitError
+		if asExit(err, &ee) {
+			code = ee.ExitCode()
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("tomato ssh %q: timed out after %s", remote, c.timeout)
+		}
+		return nil, &SSHError{Cmd: remote, ExitCode: code, Stderr: stderr.String()}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	return stdout.Bytes(), nil
+}
+
+// connectTimeoutSeconds derives an ssh ConnectTimeout (>=1s) from the overall
+// per-call timeout, leaving headroom for the command itself.
+func connectTimeoutSeconds(d time.Duration) int {
+	s := int(d.Seconds()) / 2
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
+// GetNVRAM returns the current value of an NVRAM variable and whether it is set.
+// `nvram get k` alone cannot distinguish unset from set-empty (both print
+// nothing), so we probe existence explicitly: if `nvram get k` is empty we ask
+// whether the key appears in `nvram show`. present=false means the variable is
+// not defined at all (delete should restore that absence).
+func (c *Client) GetNVRAM(key string) (value string, present bool, err error) {
+	out, err := c.run(fmt.Sprintf("nvram get %s", shellQuote(key)))
 	if err != nil {
-		return fmt.Errorf("aos login: %w", err)
+		return "", false, err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return &APIError{Method: "POST", Path: "/login-sessions", Status: resp.StatusCode, Body: string(raw)}
+	// nvram get prints the value with no trailing newline; ssh adds none.
+	v := strings.TrimSuffix(string(out), "\n")
+	if v != "" {
+		return v, true, nil
 	}
-	var out struct {
-		Cookie string `json:"cookie"`
+	// Empty: disambiguate unset vs set-empty.
+	probe := fmt.Sprintf("nvram show 2>/dev/null | grep -q %s && echo set || echo %s",
+		shellQuote(key+"="), sentinel)
+	pout, perr := c.run(probe)
+	if perr != nil {
+		return "", false, perr
 	}
-	if err := json.Unmarshal(raw, &out); err != nil || out.Cookie == "" {
-		return fmt.Errorf("aos login: no cookie in response: %s", string(raw))
+	if strings.Contains(string(pout), sentinel) {
+		return "", false, nil
 	}
-	c.cookie = out.Cookie
-	return nil
+	return "", true, nil
 }
 
-// loginRetry logs in, retrying with backoff on HTTP 503 "no free REST sessions"
-// — AOS-S caps concurrent REST sessions very low (≈5), so a slot may need a
-// moment to free (idle sessions time out). Caller must hold c.mu.
-func (c *Client) loginRetry() error {
-	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second, 20 * time.Second, 30 * time.Second}
-	var last error
-	for _, d := range delays {
-		if d > 0 {
-			time.Sleep(d)
-		}
-		err := c.login()
-		if err == nil {
-			return nil
-		}
-		var ae *APIError
-		if e, ok := err.(*APIError); ok {
-			ae = e
-		}
-		if ae == nil || ae.Status != http.StatusServiceUnavailable {
-			return err // not a session-pressure error — fail fast
-		}
-		last = err
-	}
-	return fmt.Errorf("aos login: exhausted retries waiting for a free REST session: %w", last)
+// SetNVRAM sets an NVRAM variable to value (in RAM; call Commit to persist).
+func (c *Client) SetNVRAM(key, value string) error {
+	_, err := c.run(fmt.Sprintf("nvram set %s=%s", shellQuote(key), shellQuote(value)))
+	return err
 }
 
-// logoutLocked tears down the current session. Caller must hold c.mu.
-func (c *Client) logoutLocked() {
-	if c.cookie == "" {
-		return
-	}
-	req, err := http.NewRequest(http.MethodDelete, c.base+"/login-sessions", nil)
-	if err == nil {
-		req.Header.Set("Cookie", c.cookie)
-		if resp, derr := c.http.Do(req); derr == nil {
-			resp.Body.Close()
-		}
-	}
-	c.cookie = ""
+// UnsetNVRAM removes an NVRAM variable (in RAM; call Commit to persist).
+func (c *Client) UnsetNVRAM(key string) error {
+	_, err := c.run(fmt.Sprintf("nvram unset %s", shellQuote(key)))
+	return err
 }
 
-// Logout tears down the session. Best-effort; errors are ignored.
-func (c *Client) Logout() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.logoutLocked()
+// Commit persists pending NVRAM changes to flash.
+func (c *Client) Commit() error {
+	_, err := c.run("nvram commit")
+	return err
 }
 
-// do performs one authenticated request and ALWAYS releases the session
-// afterwards (login → request → logout, under the mutex). AOS-S allows only a
-// handful of concurrent REST sessions, so holding one across a long Terraform
-// run (or leaking one per run) exhausts the cap; acquiring and releasing per
-// operation keeps at most one session live and never leaks. path is relative to
-// /rest/v8 and must start with "/". body may be nil.
-func (c *Client) do(method, path string, body []byte) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.loginRetry(); err != nil {
-		return nil, err
+// RestartService restarts a Tomato service (e.g. "wan", "dnsmasq", "firewall").
+// A "*" or "all" value restarts everything via `service * restart`. An empty
+// service is a no-op (some NVRAM keys take effect only on reboot / are read
+// live and need no restart).
+func (c *Client) RestartService(service string) error {
+	service = strings.TrimSpace(service)
+	if service == "" {
+		return nil
 	}
-	defer c.logoutLocked()
-	raw, status, err := c.attempt(method, path, body)
-	if err != nil {
-		return nil, err
-	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// Session rejected — re-login once and retry.
-		c.cookie = ""
-		if err := c.loginRetry(); err != nil {
-			return nil, err
-		}
-		raw, status, err = c.attempt(method, path, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if status/100 != 2 {
-		return nil, &APIError{Method: method, Path: path, Status: status, Body: string(raw)}
-	}
-	return raw, nil
+	_, err := c.run(fmt.Sprintf("service %s restart", shellQuoteService(service)))
+	return err
 }
 
-func (c *Client) attempt(method, path string, body []byte) ([]byte, int, error) {
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("Cookie", c.cookie)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("aos %s %s: %w", method, path, err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	return raw, resp.StatusCode, nil
+// Show returns the full `nvram show` output (every key=value line). Used by the
+// data source's whole-config read.
+func (c *Client) Show() ([]byte, error) {
+	return c.run("nvram show 2>/dev/null")
 }
 
-// Get fetches a resource. path is relative to /rest/v8 (must start with "/").
-func (c *Client) Get(path string) ([]byte, error) { return c.do(http.MethodGet, path, nil) }
-
-// Put upserts a resource with the given JSON body.
-func (c *Client) Put(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPut, path, body)
+// shellQuote single-quotes s for safe interpolation into a remote /bin/sh
+// command line, escaping embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// Post creates a resource in a collection with the given JSON body.
-func (c *Client) Post(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPost, path, body)
+// shellQuoteService quotes a service spec but preserves a bare "*"/"all" so the
+// router's `service * restart` form works (the glob must not be quoted away).
+func shellQuoteService(s string) string {
+	if s == "*" || s == "all" {
+		return s
+	}
+	return shellQuote(s)
 }
 
-// Delete removes a resource.
-func (c *Client) Delete(path string) ([]byte, error) { return c.do(http.MethodDelete, path, nil) }
+// asExit reports whether err is an *exec.ExitError and binds it to target.
+func asExit(err error, target **exec.ExitError) bool {
+	if ee, ok := err.(*exec.ExitError); ok {
+		*target = ee
+		return true
+	}
+	return false
+}

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command aruba-aos is the OpenTofu/Terraform provider plugin entrypoint for
-// ArubaOS-Switch (AOS-S) switches via the REST API v8.
+// Command tomato is the OpenTofu/Terraform provider plugin entrypoint for
+// Tomato-firmware routers (FreshTomato / AdvancedTomato), managing NVRAM over
+// SSH.
 package main
 
 import (
