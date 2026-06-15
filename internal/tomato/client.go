@@ -139,6 +139,14 @@ func (c *Client) run(remote string) ([]byte, error) {
 		"-o", "BatchMode=yes", // never prompt; fail instead of hanging
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds(c.timeout)),
+		// Multiplex every per-key nvram op over one SSH connection. A resource's
+		// read snapshots many keys (one ssh each) and Tofu applies resources
+		// concurrently; without multiplexing the rapid reconnects overwhelm the
+		// router's Dropbear ("kex_exchange_identification: Connection reset by
+		// peer"). The %C token keys the socket by connection params.
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/tomato-cm-%C",
+		"-o", "ControlPersist=20s",
 	}
 	if c.port != "" {
 		args = append(args, "-p", c.port)
