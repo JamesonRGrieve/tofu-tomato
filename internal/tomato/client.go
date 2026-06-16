@@ -27,6 +27,7 @@ package tomato
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -138,10 +139,47 @@ func (e *SSHError) Error() string {
 	return fmt.Sprintf("tomato ssh %q: exit %d: %s", e.Cmd, e.ExitCode, strings.TrimSpace(e.Stderr))
 }
 
-// run executes a single remote shell command over SSH and returns its stdout.
-// The remote command is passed as one argument to ssh, which hands it to the
-// router's shell — so callers must shell-quote any interpolated values.
+// maxSSHAttempts bounds the retry for transient connection failures (see run).
+const maxSSHAttempts = 4
+
+// run executes a remote command over SSH, retrying transient connection
+// failures. Tofu refreshes a resource's many keys (one ssh each) concurrently;
+// before the ControlMaster socket is established the initial burst can overwhelm
+// the router's Dropbear ("kex_exchange_identification: Connection reset by
+// peer" / "Connection closed"). Backing off and retrying lets a later attempt
+// reuse the master that the winning connection established.
 func (c *Client) run(remote string) ([]byte, error) {
+	var (
+		out []byte
+		err error
+	)
+	for attempt := 1; attempt <= maxSSHAttempts; attempt++ {
+		out, err = c.runOnce(remote)
+		if err == nil || attempt == maxSSHAttempts || !transientSSH(err) {
+			return out, err
+		}
+		time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+	}
+	return out, err
+}
+
+// transientSSH reports whether err is a connection-level SSH failure worth
+// retrying (the Dropbear concurrent-connect resets above), as opposed to a real
+// command error.
+func transientSSH(err error) bool {
+	var se *SSHError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return strings.Contains(se.Stderr, "kex_exchange_identification") ||
+		strings.Contains(se.Stderr, "Connection reset by") ||
+		strings.Contains(se.Stderr, "Connection closed by")
+}
+
+// runOnce executes a single remote shell command over SSH and returns its
+// stdout. The remote command is passed as one argument to ssh, which hands it to
+// the router's shell — so callers must shell-quote any interpolated values.
+func (c *Client) runOnce(remote string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 

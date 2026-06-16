@@ -78,6 +78,31 @@ func TestNewClientDefaults(t *testing.T) {
 	}
 }
 
+func TestTransientSSH(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"kex reset", &SSHError{Stderr: "kex_exchange_identification: read: Connection reset by peer"}, true},
+		{"connection reset by host", &SSHError{Stderr: "Connection reset by 10.0.0.1 port 22"}, true},
+		{"connection closed by host", &SSHError{Stderr: "Connection closed by 10.0.0.1 port 22"}, true},
+		{"real command error", &SSHError{ExitCode: 1, Stderr: "nvram: not found"}, false},
+		{"non-ssh error", errStub{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := transientSSH(tc.err); got != tc.want {
+				t.Fatalf("transientSSH() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+type errStub struct{}
+
+func (errStub) Error() string { return "boom" }
+
 func TestIdentityFileExplicitKeyFileWins(t *testing.T) {
 	c := NewClient(Config{Host: "10.0.0.1", KeyFile: "/path/to/id", KeyPEM: "ignored"})
 	path, cleanup, err := c.identityFile()
