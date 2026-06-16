@@ -101,7 +101,7 @@ func (p *tomatoProvider) Configure(ctx context.Context, req provider.ConfigureRe
 }
 
 func (p *tomatoProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource}
+	return []func() resource.Resource{NewObjectResource, NewReconcileResource}
 }
 
 func (p *tomatoProvider) DataSources(_ context.Context) []func() datasource.DataSource {
