@@ -33,6 +33,7 @@ type providerModel struct {
 	Host      types.String `tfsdk:"host"`
 	Username  types.String `tfsdk:"username"`
 	KeyFile   types.String `tfsdk:"key_file"`
+	KeyPEM    types.String `tfsdk:"key_pem"`
 	SSHBinary types.String `tfsdk:"ssh_binary"`
 }
 
@@ -62,7 +63,17 @@ func (p *tomatoProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Optional: true,
 				MarkdownDescription: "Optional SSH identity file (`ssh -i`). When unset, the system ssh " +
 					"client resolves the key / agent / OpenBao-signed certificate from ssh_config as usual. " +
-					"The provider never handles a private key directly.",
+					"Prefer `key_pem` when the key comes from a Terraform-managed source (see below).",
+			},
+			"key_pem": schema.StringAttribute{
+				Optional:  true,
+				Sensitive: true,
+				MarkdownDescription: "Optional SSH private-key material (e.g. read from OpenBao). When set " +
+					"(and `key_file` is empty), each SSH call writes it to a temp 0600 identity file and " +
+					"removes it afterward. Use this instead of pointing `key_file` at a Terraform-written " +
+					"`local_sensitive_file`: provider config is evaluated at plan, so the key is present " +
+					"during the refresh/read phase — whereas a Terraform-managed key *file* is only written " +
+					"at apply, so a refresh-time Read would fail with `Identity file … No such file`.",
 			},
 			"ssh_binary": schema.StringAttribute{
 				Optional:            true,
@@ -82,6 +93,7 @@ func (p *tomatoProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		Host:      cfg.Host.ValueString(),
 		Username:  cfg.Username.ValueString(),
 		KeyFile:   cfg.KeyFile.ValueString(),
+		KeyPEM:    cfg.KeyPEM.ValueString(),
 		SSHBinary: cfg.SSHBinary.ValueString(),
 	})
 	resp.ResourceData = client

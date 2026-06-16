@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ type Client struct {
 	port    string
 	user    string
 	keyFile string // optional explicit identity file (-i)
+	keyPEM  string // optional private-key material; materialized to a temp file per call
 	sshBin  string
 	timeout time.Duration
 	// extraArgs are appended to every ssh invocation (e.g. ProxyJump). Mostly
@@ -67,6 +69,13 @@ type Config struct {
 	// KeyFile is an optional identity file (ssh -i). When empty, the system
 	// ssh client resolves the key/agent/cert from ssh_config as usual.
 	KeyFile string
+	// KeyPEM is optional private-key material (the key itself, e.g. read from
+	// OpenBao). When set and KeyFile is empty, each SSH call materializes it to a
+	// temp 0600 file used as the identity and removes it afterward. Unlike a
+	// caller-managed key *file*, this is available during the refresh/read phase
+	// (provider config is evaluated at plan), so it avoids the ordering trap where
+	// a Terraform-written key file does not yet exist when Read runs.
+	KeyPEM string
 	// SSHBinary overrides the ssh executable (default "ssh"). For tests.
 	SSHBinary string
 	// Timeout per SSH invocation (default 30s).
@@ -97,6 +106,7 @@ func NewClient(c Config) *Client {
 		port:      port,
 		user:      user,
 		keyFile:   c.KeyFile,
+		keyPEM:    c.KeyPEM,
 		sshBin:    bin,
 		timeout:   c.Timeout,
 		extraArgs: c.ExtraArgs,
@@ -151,8 +161,13 @@ func (c *Client) run(remote string) ([]byte, error) {
 	if c.port != "" {
 		args = append(args, "-p", c.port)
 	}
-	if c.keyFile != "" {
-		args = append(args, "-i", c.keyFile, "-o", "IdentitiesOnly=yes")
+	keyPath, cleanup, kerr := c.identityFile()
+	if kerr != nil {
+		return nil, fmt.Errorf("tomato: materialize ssh identity: %w", kerr)
+	}
+	defer cleanup()
+	if keyPath != "" {
+		args = append(args, "-i", keyPath, "-o", "IdentitiesOnly=yes")
 	}
 	args = append(args, c.extraArgs...)
 	target := c.addr
@@ -178,6 +193,37 @@ func (c *Client) run(remote string) ([]byte, error) {
 		return nil, &SSHError{Cmd: remote, ExitCode: code, Stderr: stderr.String()}
 	}
 	return stdout.Bytes(), nil
+}
+
+// identityFile resolves the SSH identity for a run. An explicit keyFile wins and
+// needs no cleanup. Otherwise, if keyPEM is set, it is written to a temp 0600
+// file whose cleanup removes it (so no private key lingers on the persistent
+// runner). With neither, ssh falls back to ssh_config/agent (empty path).
+func (c *Client) identityFile() (path string, cleanup func(), err error) {
+	noop := func() {}
+	if c.keyFile != "" {
+		return c.keyFile, noop, nil
+	}
+	if strings.TrimSpace(c.keyPEM) == "" {
+		return "", noop, nil
+	}
+	f, err := os.CreateTemp("", "tomato-key-*")
+	if err != nil {
+		return "", noop, err
+	}
+	name := f.Name()
+	fail := func(e error) (string, func(), error) { _ = f.Close(); _ = os.Remove(name); return "", noop, e }
+	if err := f.Chmod(0o600); err != nil {
+		return fail(err)
+	}
+	if _, err := f.WriteString(strings.TrimRight(c.keyPEM, "\n") + "\n"); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", noop, err
+	}
+	return name, func() { _ = os.Remove(name) }, nil
 }
 
 // connectTimeoutSeconds derives an ssh ConnectTimeout (>=1s) from the overall

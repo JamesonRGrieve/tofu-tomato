@@ -37,9 +37,20 @@ We invoke the **system `ssh` binary** via `os/exec` (not an in-process SSH
 library). This (a) keeps the module dependency set byte-for-byte unchanged — no
 `golang.org/x/crypto/ssh` — per the build constraint, and (b) reuses the lab's
 existing SSH machinery: Dropbear key auth or OpenBao-signed SSH certs live in
-`ssh_config`/agent exactly as for every other lab host, so the provider never
-handles a private key. `ssh -o BatchMode=yes` ensures it fails fast instead of
-hanging on a prompt (cf. the prod-lab "net-routers plan shell SSH hang" lesson).
+`ssh_config`/agent exactly as for every other lab host. `ssh -o BatchMode=yes`
+ensures it fails fast instead of hanging on a prompt (cf. the prod-lab
+"net-routers plan shell SSH hang" lesson).
+
+**Key material — `key_file` vs `key_pem`.** The transport stays a shell-out
+either way (go.mod unchanged). `key_file` points ssh at an identity file.
+`key_pem` carries the key *material* (e.g. from OpenBao): each call writes it to
+a temp 0600 file and removes it afterward. Prefer `key_pem` over pointing
+`key_file` at a Terraform-managed `local_sensitive_file` — provider config is
+evaluated at **plan**, so the key is present during the refresh/read phase,
+whereas a Terraform-written key *file* only exists after **apply**, so a
+refresh-time Read fails with `Identity file … No such file`. This is the one
+case the provider materializes a private key itself; `key_file`/`ssh_config`
+paths still never touch the material.
 
 ## Design tenets
 

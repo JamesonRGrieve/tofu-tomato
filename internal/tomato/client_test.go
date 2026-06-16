@@ -2,7 +2,10 @@
 
 package tomato
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestSplitHostPort(t *testing.T) {
 	cases := []struct {
@@ -72,5 +75,59 @@ func TestNewClientDefaults(t *testing.T) {
 	}
 	if c.addr != "10.0.0.1" || c.port != "" {
 		t.Errorf("addr/port = %q/%q", c.addr, c.port)
+	}
+}
+
+func TestIdentityFileExplicitKeyFileWins(t *testing.T) {
+	c := NewClient(Config{Host: "10.0.0.1", KeyFile: "/path/to/id", KeyPEM: "ignored"})
+	path, cleanup, err := c.identityFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if path != "/path/to/id" {
+		t.Fatalf("path = %q, want explicit key_file", path)
+	}
+}
+
+func TestIdentityFileNoneFallsBackToSSHConfig(t *testing.T) {
+	c := NewClient(Config{Host: "10.0.0.1"})
+	path, cleanup, err := c.identityFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if path != "" {
+		t.Fatalf("path = %q, want empty (ssh_config fallback)", path)
+	}
+}
+
+func TestIdentityFileMaterializesKeyPEM(t *testing.T) {
+	const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----"
+	c := NewClient(Config{Host: "10.0.0.1", KeyPEM: pem})
+	path, cleanup, err := c.identityFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path == "" {
+		t.Fatal("expected a temp identity path")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("temp key not written: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("temp key perm = %o, want 600", perm)
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // test reads the temp file it just wrote
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != pem+"\n" {
+		t.Fatalf("temp key content = %q, want pem + trailing newline", string(got))
+	}
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cleanup did not remove temp key: %v", err)
 	}
 }
